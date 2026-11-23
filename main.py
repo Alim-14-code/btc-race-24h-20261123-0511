@@ -1,23 +1,23 @@
-"""Momentum scalper: slow trend-following bot for cbBTC/USDC 1-minute bars.
+"""R2 bot for make.fun btc-race-24h-20261123-0511: one-trade trend rider.
 
-Strategy (own design, written from the competition spec):
-- Trend filter: only buy when the 1-minute close is above its 120-bar SMA.
-- Entry: EMA(24) crosses above EMA(96) while the trend filter holds, full
-  cash, one position at a time.
-- Exit: EMA(24) crosses back below EMA(96), OR price falls 1.2% below the
-  highest close since entry (trailing stop), OR price falls 2% below the
-  entry fill price (hard stop).
-- Cooldown: after any sell, wait 30 bars before buying again, to avoid
-  whipsaw re-entries on the same chop.
-- No trade in the first 120 bars (indicators warming up) and never during a
-  warm-up phase. Deterministic: no clock, no randomness, no network, no
-  files; every decision comes from the bars the harness sends.
+Idea (written from scratch for this entry, no other entry's code read):
+the dev window's money was one sustained 6-hour uptrend followed by flat
+chop. Fast EMA crosses whipsaw on 1-minute bars (the kit's own ema-cross
+baseline loses -$114.83 in 76 trades); cross-down / momentum-reversal exits
+do the same. So this bot enters ONCE, on a confirmed hourly move, then
+holds with a wide trailing stop and never exits on a cross.
 
-Protocol: agent-fun/bars-replay/v1, via the kit's Python shim (vendored
-unchanged under vendor/). Orders fill at the next bar's open, so the
-max_slippage_bps of 250 bps covers the largest 1-minute moves seen in the
-dev window (~72 bps) plus the modelled 2 bps slippage and price impact,
-with headroom for bigger jumps on the unseen race window.
+  Entry (flat): 60-bar return > +0.5% AND 24-bar return > 0 AND the close
+    above SMA(120) once the average exists (before bar 120 the average
+    does not gate). Full size: 100% of equity.
+  Exit: trailing stop 2.0% under the highest close since entry.
+  Safety: if the position is still below breakeven 120 bars (2h) after
+    entry, the trend thesis was wrong — exit. No re-entry for 120 bars
+    after any exit, so a bad day cannot bleed through repeated bounces.
+
+Long only, no leverage, no shorts. Deterministic: float math on closes
+only, no clock, no environment, no randomness, so two runs agree exactly.
+Standard library only, plus the kit's vendored bars shim.
 """
 
 import os
@@ -27,110 +27,97 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "ven
 import makefun_bars
 
 SYMBOL = "CBBTC"
-FAST_SPAN = 24
-SLOW_SPAN = 96
-SMA_WINDOW = 120
-TRAIL_PCT = 0.012
-HARD_STOP_PCT = 0.02
-COOLDOWN_BARS = 30
-MAX_SLIPPAGE_BPS = 250
+
+# Entry: the hourly move that confirms a trend, and the short-term move
+# still pointing the same way.
+ENTRY_R60_BPS = 50          # 60-bar return above +0.5%
+ENTRY_R24_MIN = 0.0         # 24-bar return above 0
+SMA_BARS = 120              # 2-hour average; gates entries once it exists
+
+# Exit: a trailing stop wide enough to survive the chop (1-2% ranges),
+# a time stop for trades that never follow through, and a re-entry pause.
+TRAILING_STOP = 0.02        # 2.0% under the peak close since entry
+TIME_STOP_BARS = 120        # 2 hours
+COOLDOWN_BARS = 120         # no re-entry for 2 hours after an exit
+MAX_SLIPPAGE_BPS = 300      # 3% past the close decided on; 1-min gaps stay well under it
+
+_closes = []
+_peak = None        # highest close seen since entry
+_entry_cost = None  # cash spent on the open position (notional, fees included)
+_entry_seq = None   # batch seq of the entry decision
+_last_exit_seq = -10 ** 9
 
 
-class TrendBot:
-    def __init__(self):
-        self.closes = []
-        self.fast_ema = None
-        self.slow_ema = None
-        self.prev_fast = None
-        self.prev_slow = None
-        self.sma_sum = 0.0
-        self.entry_price = None
-        self.peak_price = None
-        self.last_sell_seq = -10 ** 9
-
-    def _update(self, close):
-        self.closes.append(close)
-        kf = 2.0 / (FAST_SPAN + 1)
-        ks = 2.0 / (SLOW_SPAN + 1)
-        self.prev_fast, self.prev_slow = self.fast_ema, self.slow_ema
-        self.fast_ema = close if self.fast_ema is None else close * kf + self.fast_ema * (1 - kf)
-        self.slow_ema = close if self.slow_ema is None else close * ks + self.slow_ema * (1 - ks)
-        self.sma_sum += close
-        if len(self.closes) > SMA_WINDOW:
-            self.sma_sum -= self.closes[-SMA_WINDOW - 1]
-
-    def _sma(self):
-        if len(self.closes) < SMA_WINDOW:
-            return None
-        return self.sma_sum / SMA_WINDOW
+def _return_bars(n):
+    """Close now over the close n bars back, minus one; None without history."""
+    if len(_closes) <= n:
+        return None
+    return _closes[-1] / _closes[-1 - n] - 1.0
 
 
-BOT = TrendBot()
+def _sma(n):
+    """Simple mean of the last n closes; None without enough history."""
+    if len(_closes) < n:
+        return None
+    return sum(_closes[-n:]) / n
 
 
 def on_batch(state, batch):
+    close = state.close(SYMBOL)
+    if close is not None:
+        _closes.append(close)
     if state.warming_up:
         return []
-    close = state.close(SYMBOL)
+
+    global _peak, _entry_cost, _entry_seq, _last_exit_seq
+
     if close is None:
         return []
-    BOT._update(close)
-    n = len(BOT.closes)
-    if n < max(SLOW_SPAN, SMA_WINDOW):
-        return []
     held = state.positions.get(SYMBOL)
-    sma = BOT._sma()
-    crossed_up = (
-        BOT.prev_fast is not None
-        and BOT.prev_fast <= BOT.prev_slow
-        and BOT.fast_ema > BOT.slow_ema
-    )
-    crossed_down = (
-        BOT.prev_fast is not None
-        and BOT.prev_fast >= BOT.prev_slow
-        and BOT.fast_ema < BOT.slow_ema
-    )
-    if held is None or held.qty == 0:
-        if (
-            crossed_up
-            and sma is not None
-            and close > sma
-            and state.seq - BOT.last_sell_seq > COOLDOWN_BARS
-            and state.cash >= 1_000_000
-        ):
-            BOT.entry_price = close
-            BOT.peak_price = close
-            return [
-                {
-                    "side": "buy",
-                    "symbol": SYMBOL,
-                    "notional_quote_units": state.cash,
-                    "max_slippage_bps": MAX_SLIPPAGE_BPS,
-                }
-            ]
+    seq = state.seq
+
+    if held is not None:
+        # Track the peak close since entry, then check the exits.
+        if _peak is None or close > _peak:
+            _peak = close
+        exit_now = False
+        if _peak is not None and close < _peak * (1.0 - TRAILING_STOP):
+            exit_now = True
+        if not exit_now and _entry_seq is not None and _entry_cost is not None:
+            if seq - _entry_seq >= TIME_STOP_BARS:
+                if state.value(SYMBOL, held.qty) < _entry_cost:
+                    exit_now = True
+        if exit_now:
+            _peak = None
+            _entry_cost = None
+            _entry_seq = None
+            _last_exit_seq = seq
+            return [{"side": "sell", "symbol": SYMBOL, "qty": held.qty,
+                     "max_slippage_bps": MAX_SLIPPAGE_BPS}]
         return []
-    # Holding a position: track the peak and check exits.
-    if close > BOT.peak_price:
-        BOT.peak_price = close
-    stop_hit = (
-        BOT.entry_price is not None and close < BOT.entry_price * (1 - HARD_STOP_PCT)
-    )
-    trail_hit = (
-        BOT.peak_price is not None and close < BOT.peak_price * (1 - TRAIL_PCT)
-    )
-    if crossed_down or stop_hit or trail_hit:
-        BOT.last_sell_seq = state.seq
-        BOT.entry_price = None
-        BOT.peak_price = None
-        return [
-            {
-                "side": "sell",
-                "symbol": SYMBOL,
-                "qty": held.qty,
-                "max_slippage_bps": MAX_SLIPPAGE_BPS,
-            }
-        ]
-    return []
+
+    # Flat: enter only on a confirmed hourly move, with the short-term
+    # move agreeing and the price above its 2-hour average.
+    if seq - _last_exit_seq < COOLDOWN_BARS:
+        return []
+    r60 = _return_bars(60)
+    r24 = _return_bars(24)
+    sma = _sma(SMA_BARS)
+    if r60 is None or r60 <= ENTRY_R60_BPS / 10000.0:
+        return []
+    if r24 is None or r24 <= ENTRY_R24_MIN:
+        return []
+    if sma is not None and close <= sma:
+        return []
+    notional = state.equity if state.equity < state.cash else state.cash
+    if notional < 1_000_000:
+        return []
+    _peak = close
+    _entry_cost = notional
+    _entry_seq = seq
+    return [{"side": "buy", "symbol": SYMBOL,
+             "notional_quote_units": notional,
+             "max_slippage_bps": MAX_SLIPPAGE_BPS}]
 
 
 makefun_bars.run(on_batch)
